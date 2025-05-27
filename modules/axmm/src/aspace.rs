@@ -10,6 +10,7 @@ use memory_set::{MemoryArea, MemorySet};
 
 use crate::backend::Backend;
 use crate::mapping_err_to_ax_err;
+use crate::page::page_manager;
 
 /// The virtual memory address space.
 pub struct AddrSpace {
@@ -373,9 +374,14 @@ impl AddrSpace {
         if let Some(area) = self.areas.find(vaddr) {
             let orig_flags = area.flags();
             if orig_flags.contains(access_flags) {
-                return area
-                    .backend()
-                    .handle_page_fault(vaddr, orig_flags, &mut self.pt);
+                if let Ok((paddr, _, _)) = self.pt.query(vaddr) {
+                    // TODO: skip Shared
+                    return self.handle_page_fault_cow(vaddr, paddr, orig_flags);
+                } else {
+                    return area
+                        .backend()
+                        .handle_page_fault(vaddr, orig_flags, &mut self.pt);
+                }
             }
         }
         false
@@ -433,6 +439,94 @@ impl AddrSpace {
         }
         Ok(new_aspace)
     }
+
+    ///
+    pub fn copy_with_cow(&mut self) -> AxResult<Self> {
+        let mut new_aspace = Self::new_empty(self.base(), self.size())?;
+        let new_pt = &mut new_aspace.pt;
+        let old_pt = &mut self.pt;
+
+        for area in self.areas.iter() {
+            let backend = area.backend();
+            // Copy the memory area in the new address space.
+            let new_area =
+                MemoryArea::new(area.start(), area.size(), area.flags(), backend.clone());
+            // TODO: skip shared
+            new_aspace
+                .areas
+                .map(new_area, new_pt, false)
+                .map_err(mapping_err_to_ax_err)?;
+
+            // TODO:
+            // - huge page
+            for vaddr in PageIter4K::new(area.start(), area.end()).unwrap() {
+                // NOTE: dealloc new_aspace.areas.map()
+                if let Ok((paddr, _, tlb)) = new_pt.unmap(vaddr) {
+                    page_manager().lock().dealloc(paddr);
+                    tlb.flush();
+                }
+
+                if let Ok((paddr, mut flags, size)) = old_pt.query(vaddr) {
+                    // TODO: tlb flush
+                    flags.remove(MappingFlags::WRITE);
+                    trace!(
+                        "cow => vaddr : {:#?}, paddr : {:#?}, vflags: {:#?}, flags: {:#?}",
+                        vaddr,
+                        paddr,
+                        area.flags(),
+                        flags
+                    );
+                    let _ = old_pt.protect(vaddr, flags).map(|(_, tlb)| tlb.flush());
+                    // cover
+                    let _ = new_pt.map(vaddr, paddr, size, flags).map(|tlb| tlb.flush());
+                    page_manager().lock().add_page_ref(paddr);
+                }
+            }
+        }
+        Ok(new_aspace)
+    }
+
+    ///
+    fn handle_page_fault_cow(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        orig_flags: MappingFlags,
+    ) -> bool {
+        // TODO: huge page
+        let ref_count = page_manager().lock().page_ref(paddr);
+        debug!(
+            "handle_page_fault_cow => ref_count : {}, flags : {:#?}, vaddr: {:#?}",
+            ref_count, orig_flags, vaddr,
+        );
+
+        // no more ref
+        if ref_count == 1 {
+            let res = self.pt.protect(vaddr, orig_flags).map(|(_, tlb)| {
+                tlb.flush();
+            });
+            return res.is_ok();
+        }
+
+        // need copy
+        let new_paddr = page_manager().lock().alloc(false);
+        if let Ok(new_paddr) = new_paddr {
+            if let Err(e) = page_manager().lock().copy_page(paddr, new_paddr) {
+                debug!("copy page fault : {}", e);
+                return false;
+            }
+
+            page_manager().lock().sub_page_ref(paddr);
+            self.pt
+                .remap(vaddr, new_paddr, orig_flags)
+                .map(|(_, tlb)| {
+                    tlb.flush();
+                })
+                .is_ok()
+        } else {
+            false
+        }
+    }
 }
 
 impl fmt::Debug for AddrSpace {
@@ -447,6 +541,7 @@ impl fmt::Debug for AddrSpace {
 
 impl Drop for AddrSpace {
     fn drop(&mut self) {
+        debug!("AddrSpace drop ..... ");
         self.clear();
     }
 }
