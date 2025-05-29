@@ -446,49 +446,46 @@ impl AddrSpace {
         Ok(new_aspace)
     }
 
+    /// Creates a copy of the current [`AddrSpace`] with copy-on-write (COW)
     ///
+    /// For pages that require COW, remove `write` flags.
     pub fn copy_with_cow(&mut self) -> AxResult<Self> {
+        // TODO: huge page
         let mut new_aspace = Self::new_empty(self.base(), self.size())?;
         let new_pt = &mut new_aspace.pt;
         let old_pt = &mut self.pt;
 
         for area in self.areas.iter() {
-            let backend = area.backend();
             // Copy the memory area in the new address space.
+
+            let backend = area.backend();
             let new_area =
                 MemoryArea::new(area.start(), area.size(), area.flags(), backend.clone());
-            // TODO: skip shared
+            // TODO: Shared mem area
             new_aspace
                 .areas
-                .map(new_area, new_pt, false)
+                .insert_area(new_area)
                 .map_err(mapping_err_to_ax_err)?;
 
-            // TODO:
-            // - huge page
             for vaddr in PageIter4K::new(area.start(), area.end()).unwrap() {
-                // NOTE: dealloc new_aspace.areas.map()
-                if let Ok((paddr, _, tlb)) = new_pt.unmap(vaddr) {
-                    page_manager().lock().dealloc(paddr);
-                    tlb.flush();
-                }
-
                 if let Ok((paddr, mut flags, size)) = old_pt.query(vaddr) {
-                    // TODO: tlb flush
+                    // remove `write` flags
                     flags.remove(MappingFlags::WRITE);
-                    trace!(
-                        "cow => vaddr : {:#?}, paddr : {:#?}, vflags: {:#?}, flags: {:#?}",
-                        vaddr,
-                        paddr,
-                        area.flags(),
-                        flags
-                    );
-                    let _ = old_pt.protect(vaddr, flags).map(|(_, tlb)| tlb.flush());
-                    // cover
-                    let _ = new_pt.map(vaddr, paddr, size, flags).map(|tlb| tlb.flush());
+                    old_pt
+                        .protect(vaddr, flags)
+                        .map(|(_, tlb)| tlb.flush())
+                        .ok();
+                    // The same physical page is mapped in the new page table
+                    new_pt
+                        .map(vaddr, paddr, size, flags)
+                        .map(|tlb| tlb.flush())
+                        .ok();
+                    // NOTE: Increment the physical page reference count
                     page_manager().lock().inc_page_ref(paddr);
                 }
             }
         }
+
         Ok(new_aspace)
     }
 

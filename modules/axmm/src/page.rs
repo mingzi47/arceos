@@ -44,13 +44,6 @@ impl PageManager {
 
                 let page = Arc::new(Page::new(page));
 
-                debug!(
-                    "page manager => alloc : {:#?}, zeroed : {}, size = {}",
-                    page.start_paddr(),
-                    zeroed,
-                    self.phys2page.len()
-                );
-
                 assert!(
                     self.phys2page
                         .insert(page.start_paddr(), page.clone())
@@ -66,14 +59,12 @@ impl PageManager {
     /// Decrement the reference count of the page at the given physical address.
     /// When the reference count is 0, it is reclaimed by RAII
     pub fn dealloc(&mut self, paddr: PhysAddr) {
-        debug!("page manager => dealloc : {:#?}", paddr);
         self.dec_page_ref(paddr);
     }
 
     /// Increment the reference count of the page at the given physical address.
     pub fn inc_page_ref(&self, paddr: PhysAddr) {
         if let Some(page) = self.find_page(paddr) {
-            debug!("page manager => add ref : {:#?}", paddr);
             page.inc_ref();
         }
     }
