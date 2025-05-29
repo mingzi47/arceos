@@ -1,4 +1,4 @@
-use core::fmt::{self};
+use core::fmt;
 
 use axerrno::{AxError, AxResult, ax_err};
 use axhal::mem::phys_to_virt;
