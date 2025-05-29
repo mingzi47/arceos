@@ -1,4 +1,4 @@
-use core::fmt;
+use core::fmt::{self};
 
 use axerrno::{AxError, AxResult, ax_err};
 use axhal::mem::phys_to_virt;
@@ -376,6 +376,12 @@ impl AddrSpace {
             if orig_flags.contains(access_flags) {
                 if let Ok((paddr, _, _)) = self.pt.query(vaddr) {
                     // TODO: skip Shared
+                    if !access_flags.contains(MappingFlags::WRITE) {
+                        return false;
+                    }
+                    // 1. page fault caused by write
+                    // 2. pte exists
+                    // 3. Not shared memory
                     return self.handle_page_fault_cow(vaddr, paddr, orig_flags);
                 } else {
                     return area
@@ -479,14 +485,23 @@ impl AddrSpace {
                     let _ = old_pt.protect(vaddr, flags).map(|(_, tlb)| tlb.flush());
                     // cover
                     let _ = new_pt.map(vaddr, paddr, size, flags).map(|tlb| tlb.flush());
-                    page_manager().lock().add_page_ref(paddr);
+                    page_manager().lock().inc_page_ref(paddr);
                 }
             }
         }
         Ok(new_aspace)
     }
 
+    /// Handles a Copy-On-Write (COW) page fault.
     ///
+    /// # Arguments
+    /// - `vaddr`: The virtual address that triggered the fault.
+    /// - `paddr`: The physical address currently mapped to the faulting virtual address.
+    /// - `orig_flags`: The MemoryArea flags.
+    ///
+    /// # Returns
+    /// - `true` if the page fault was handled successfully.
+    /// - `false` if the fault handling failed (e.g., allocation failed or invalid ref count).
     fn handle_page_fault_cow(
         &mut self,
         vaddr: VirtAddr,
@@ -494,35 +509,42 @@ impl AddrSpace {
         orig_flags: MappingFlags,
     ) -> bool {
         // TODO: huge page
-        let ref_count = page_manager().lock().page_ref(paddr);
-        debug!(
-            "handle_page_fault_cow => ref_count : {}, flags : {:#?}, vaddr: {:#?}",
-            ref_count, orig_flags, vaddr,
-        );
+        let mut page_manager = page_manager().lock();
 
-        // no more ref
-        if ref_count == 1 {
-            let res = self.pt.protect(vaddr, orig_flags).map(|(_, tlb)| {
-                tlb.flush();
-            });
-            return res.is_ok();
-        }
+        if let Some(old_page) = page_manager.find_page(paddr) {
+            let ref_count = old_page.ref_count();
 
-        // need copy
-        let new_paddr = page_manager().lock().alloc(false);
-        if let Ok(new_paddr) = new_paddr {
-            if let Err(e) = page_manager().lock().copy_page(paddr, new_paddr) {
-                debug!("copy page fault : {}", e);
-                return false;
+            debug!(
+                "handle_page_fault_cow => ref_count : {}, flags : {:#?}, vaddr: {:#?}",
+                ref_count, orig_flags, vaddr,
+            );
+
+            match ref_count {
+                0 => false,
+                // There is only one AddrSpace reference to the page,
+                // so there is no need to copy it.
+                1 => self
+                    .pt
+                    .protect(vaddr, orig_flags)
+                    .map(|(_, tlb)| tlb.flush())
+                    .is_ok(),
+                // Allocates the new page and copies the contents of the original page,
+                // remapping the virtual address to the physical address of the new page.
+                // NOTE: Reduce the page's reference count
+                2.. => match page_manager.alloc(false) {
+                    Ok(new_page) => {
+                        new_page.copy_form(old_page);
+                        page_manager.dec_page_ref(paddr);
+                        self.pt
+                            .remap(vaddr, new_page.start_paddr(), orig_flags)
+                            .map(|(_, tlb)| {
+                                tlb.flush();
+                            })
+                            .is_ok()
+                    }
+                    Err(_) => false,
+                },
             }
-
-            page_manager().lock().sub_page_ref(paddr);
-            self.pt
-                .remap(vaddr, new_paddr, orig_flags)
-                .map(|(_, tlb)| {
-                    tlb.flush();
-                })
-                .is_ok()
         } else {
             false
         }

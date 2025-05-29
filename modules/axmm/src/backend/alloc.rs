@@ -6,8 +6,11 @@ use crate::page::page_manager;
 use super::Backend;
 
 fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
-    let paddr = page_manager().lock().alloc(zeroed).ok()?;
-    Some(paddr)
+    page_manager()
+        .lock()
+        .alloc(zeroed)
+        .ok()
+        .map(|page| page.start_paddr())
 }
 
 fn dealloc_frame(frame: PhysAddr) {

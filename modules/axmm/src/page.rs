@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 use axalloc::GlobalPage;
-use axerrno::{AxError, AxResult};
+use axerrno::AxResult;
 use axhal::mem::virt_to_phys;
 use kspin::{SpinNoIrq, SpinRaw};
 use lazyinit::LazyInit;
@@ -18,6 +18,8 @@ pub fn page_manager() -> &'static SpinNoIrq<PageManager> {
     &PAGE_MANAGER
 }
 
+/// Manages the physical pages allocated in AddrSpace,
+/// typically Backend::Alloc physical page frames
 pub struct PageManager {
     phys2page: BTreeMap<PhysAddr, Arc<Page>>,
 }
@@ -29,92 +31,69 @@ impl PageManager {
         }
     }
 
-    pub fn alloc(&mut self, zeroed: bool) -> AxResult<PhysAddr> {
-        let res = GlobalPage::alloc();
-        match res {
+    /// Allocate a new page.
+    ///
+    /// - `zeroed` : Whether to zero out the page content or not.
+    /// - Return: newly allocated page, or error.
+    pub fn alloc(&mut self, zeroed: bool) -> AxResult<Arc<Page>> {
+        match GlobalPage::alloc() {
             Ok(mut page) => {
                 if zeroed {
                     page.zero();
                 }
-                let paddr = page.start_paddr(virt_to_phys);
+
+                let page = Arc::new(Page::new(page));
+
                 debug!(
                     "page manager => alloc : {:#?}, zeroed : {}, size = {}",
-                    paddr,
+                    page.start_paddr(),
                     zeroed,
                     self.phys2page.len()
                 );
 
-                self.phys2page.insert(paddr, Arc::new(Page::new(page)));
-                Ok(paddr)
+                assert!(
+                    self.phys2page
+                        .insert(page.start_paddr(), page.clone())
+                        .is_none()
+                );
+
+                Ok(page.clone())
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Decrement the reference count of the page at the given physical address.
+    /// When the reference count is 0, it is reclaimed by RAII
     pub fn dealloc(&mut self, paddr: PhysAddr) {
         debug!("page manager => dealloc : {:#?}", paddr);
-        self.sub_page_ref(paddr);
+        self.dec_page_ref(paddr);
     }
 
-    pub fn add_page_ref(&self, paddr: PhysAddr) {
+    /// Increment the reference count of the page at the given physical address.
+    pub fn inc_page_ref(&self, paddr: PhysAddr) {
         if let Some(page) = self.find_page(paddr) {
             debug!("page manager => add ref : {:#?}", paddr);
-            page.add_ref_count();
+            page.inc_ref();
         }
     }
 
-    pub fn sub_page_ref(&mut self, paddr: PhysAddr) {
+    /// Decrement the reference count of the page at the given physical address.
+    /// When the reference count is 0, it is reclaimed by RAII
+    pub fn dec_page_ref(&mut self, paddr: PhysAddr) {
         if let Some(page) = self.find_page(paddr) {
-            match page.sub_ref_count() {
+            match page.dec_ref() {
                 1 => {
                     debug!("page manager => sub ref : {:#?}. ref : 0", paddr);
                     self.phys2page.remove(&paddr);
                 }
-                n => debug!("page manager => sub ref : {:#?}, ref : {}", paddr, n - 1),
+                n => trace!("page manager => sub ref : {:#?}, ref : {}", paddr, n - 1),
             }
         }
     }
 
-    pub fn page_ref(&self, paddr: PhysAddr) -> usize {
-        if let Some(page) = self.find_page(paddr) {
-            page.ref_count()
-        } else {
-            0
-        }
-    }
-
-    pub fn copy_page(&mut self, old_addr: PhysAddr, new_addr: PhysAddr) -> AxResult<()> {
-        debug!(
-            "page manager => copy page, old: {:#?}, new: {:#?}",
-            old_addr, new_addr
-        );
-        let new_page = {
-            if let Some(new_page) = self.find_page(new_addr) {
-                new_page.clone()
-            } else {
-                // TODO: err
-                return Err(AxError::NoMemory);
-            }
-        };
-
-        let old_page = {
-            if let Some(old_page) = self.find_page(old_addr) {
-                old_page.clone()
-            } else {
-                debug!("not found old_page");
-                // TODO: err
-                return Err(AxError::NoMemory);
-            }
-        };
-
-        let mut new_page = new_page.inner.lock();
-        let old_page = old_page.inner.lock();
-
-        new_page.as_slice_mut().copy_from_slice(old_page.as_slice());
-        Ok(())
-    }
-
-    fn find_page(&self, addr: PhysAddr) -> Option<Arc<Page>> {
+    /// Find the page for the given physical address.
+    pub fn find_page(&self, addr: PhysAddr) -> Option<Arc<Page>> {
         if let Some((_, value)) = self.phys2page.range(..=addr).next_back() {
             if value.contain_paddr(addr) {
                 Some(value.clone())
@@ -129,6 +108,7 @@ impl PageManager {
 
 pub struct Page {
     inner: SpinRaw<GlobalPage>,
+    // page ref count
     ref_count: AtomicUsize,
 }
 
@@ -140,22 +120,37 @@ impl Page {
         }
     }
 
-    pub fn add_ref_count(&self) -> usize {
+    fn inc_ref(&self) -> usize {
         self.ref_count.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn sub_ref_count(&self) -> usize {
+    fn dec_ref(&self) -> usize {
         self.ref_count.fetch_sub(1, Ordering::SeqCst)
     }
 
+    /// Get current page reference count.
     pub fn ref_count(&self) -> usize {
         self.ref_count.load(Ordering::SeqCst)
     }
 
+    /// Get the starting physical address of the page.
+    pub fn start_paddr(&self) -> PhysAddr {
+        self.inner.lock().start_paddr(virt_to_phys)
+    }
+
+    /// Check if the physical address is on the page
     pub fn contain_paddr(&self, addr: PhysAddr) -> bool {
         let page = self.inner.lock();
         let start = page.start_paddr(virt_to_phys);
 
         start <= addr && addr <= start + page.size()
+    }
+
+    /// Copy data from another page to this page.
+    pub fn copy_form(&self, other: Arc<Page>) {
+        self.inner
+            .lock()
+            .as_slice_mut()
+            .copy_from_slice(other.inner.lock().as_slice());
     }
 }
