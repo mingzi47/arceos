@@ -31,17 +31,18 @@ impl PageManager {
         }
     }
 
-    /// Allocate a new page.
+    /// Allocate contiguous 4K-sized pages.
     ///
-    /// - `zeroed` : Whether to zero out the page content or not.
-    /// - Return: newly allocated page, or error.
-    pub fn alloc(&mut self, zeroed: bool) -> AxResult<Arc<Page>> {
-        match GlobalPage::alloc() {
-            Ok(mut page) => {
-                if zeroed {
-                    page.zero();
-                }
-
+    /// # Parameters
+    ///
+    /// - `num_pages`: The number of contiguous physical pages to allocate.
+    /// - `align_pow2`: The alignment requirement expressed as a power of two. The starting address
+    ///   of the allocated memory will be aligned to `2^align_pow2` bytes.
+    /// # Returns
+    /// -  newly allocated page, or error.
+    pub fn alloc(&mut self, num_pages: usize, align_pow2: usize) -> AxResult<Arc<Page>> {
+        match GlobalPage::alloc_contiguous(num_pages, align_pow2) {
+            Ok(page) => {
                 let page = Arc::new(Page::new(page));
 
                 assert!(
@@ -117,6 +118,11 @@ impl Page {
 
     fn dec_ref(&self) -> usize {
         self.ref_count.fetch_sub(1, Ordering::SeqCst)
+    }
+
+    // Fill physical memory with zero
+    pub fn zero(&self) {
+        self.inner.lock().zero();
     }
 
     /// Get current page reference count.

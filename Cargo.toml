@@ -71,5 +71,3 @@ lto = true
 [patch.crates-io]
 page_table_multiarch = { git = "https://github.com/Mivik/page_table_multiarch.git", rev = "19ededd" }
 page_table_entry = { git = "https://github.com/Mivik/page_table_multiarch.git", rev = "19ededd" }
-memory_set = { git = "https://github.com/mingzi47/axmm_crates.git", rev = "140133e1a6ccb2433f8d1408752f4e98a3bc6f6d" }
-memory_addr = { git = "https://github.com/mingzi47/axmm_crates.git", rev = "140133e1a6ccb2433f8d1408752f4e98a3bc6f6d" }

@@ -1,5 +1,5 @@
 use axhal::paging::{MappingFlags, PageSize, PageTable};
-use memory_addr::{PageIter4K, PhysAddr, VirtAddr};
+use memory_addr::{PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr};
 
 use crate::page::page_manager;
 
@@ -8,9 +8,14 @@ use super::Backend;
 fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
     page_manager()
         .lock()
-        .alloc(zeroed)
+        .alloc(1, PAGE_SIZE_4K)
         .ok()
-        .map(|page| page.start_paddr())
+        .map(|page| {
+            if zeroed {
+                page.zero();
+            }
+            page.start_paddr()
+        })
 }
 
 fn dealloc_frame(frame: PhysAddr) {

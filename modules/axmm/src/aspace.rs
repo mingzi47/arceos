@@ -374,7 +374,7 @@ impl AddrSpace {
         if let Some(area) = self.areas.find(vaddr) {
             let orig_flags = area.flags();
             if orig_flags.contains(access_flags) {
-                if let Ok((paddr, _, _)) = self.pt.query(vaddr) {
+                if let Ok((paddr, _, page_size)) = self.pt.query(vaddr) {
                     // TODO: skip Shared
                     if !access_flags.contains(MappingFlags::WRITE) {
                         return false;
@@ -382,7 +382,7 @@ impl AddrSpace {
                     // 1. page fault caused by write
                     // 2. pte exists
                     // 3. Not shared memory
-                    return self.handle_page_fault_cow(vaddr, paddr, orig_flags);
+                    return self.handle_page_fault_cow(vaddr, paddr, page_size.into(), orig_flags);
                 } else {
                     return area
                         .backend()
@@ -457,15 +457,30 @@ impl AddrSpace {
 
         for area in self.areas.iter() {
             // Copy the memory area in the new address space.
+            //
+            let mut is_shared = false;
 
-            let backend = area.backend();
-            let new_area =
-                MemoryArea::new(area.start(), area.size(), area.flags(), backend.clone());
+            let mut backend = area.backend().clone();
             // TODO: Shared mem area
+            match &mut backend {
+                // Forcing `populate = false` is to prevent the subsequent `new_aspace.areas.map`
+                // from mapping page table entries for the virtual addresses.
+                Backend::Alloc { populate, .. } => {
+                    *populate = false;
+                }
+                // Linear-backed regions are usually allocated by the kernel and are shared
+                Backend::Linear { .. } => is_shared = true,
+            }
+
+            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), backend);
             new_aspace
                 .areas
-                .insert_area(new_area)
+                .map(new_area, new_pt, false)
                 .map_err(mapping_err_to_ax_err)?;
+
+            if is_shared {
+                continue;
+            }
 
             for vaddr in PageIter4K::new(area.start(), area.end()).unwrap() {
                 if let Ok((paddr, mut flags, size)) = old_pt.query(vaddr) {
@@ -503,9 +518,9 @@ impl AddrSpace {
         &mut self,
         vaddr: VirtAddr,
         paddr: PhysAddr,
+        page_size: usize,
         orig_flags: MappingFlags,
     ) -> bool {
-        // TODO: huge page
         let mut page_manager = page_manager().lock();
 
         if let Some(old_page) = page_manager.find_page(paddr) {
@@ -528,7 +543,7 @@ impl AddrSpace {
                 // Allocates the new page and copies the contents of the original page,
                 // remapping the virtual address to the physical address of the new page.
                 // NOTE: Reduce the page's reference count
-                2.. => match page_manager.alloc(false) {
+                2.. => match page_manager.alloc(page_size / PAGE_SIZE_4K, PAGE_SIZE_4K) {
                     Ok(new_page) => {
                         new_page.copy_form(old_page);
                         page_manager.dec_page_ref(paddr);
