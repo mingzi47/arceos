@@ -19,7 +19,6 @@ pub use alloc::alloc_frame;
 ///   contiguous and their addresses should be known when creating the mapping.
 /// - **Allocation**: used in general, or for lazy mappings. The target physical
 ///   frames are obtained from the global allocator.
-#[derive(Clone)]
 pub enum Backend {
     /// Linear mapping backend.
     ///
@@ -80,6 +79,29 @@ impl MappingBackend for Backend {
             .protect_region(start, size, new_flags, true)
             .map(|tlb| tlb.ignore())
             .is_ok()
+    }
+}
+
+//
+impl Clone for Backend {
+    fn clone(&self) -> Self {
+        match self {
+            Backend::Alloc { populate, tracker } => {
+                let backend = Self::new_alloc(*populate);
+                let new_tracker = match &backend {
+                    Backend::Alloc { tracker, .. } => tracker.clone(),
+                    _ => unreachable!(),
+                };
+
+                tracker.for_each(|(vaddr, frame)| {
+                    debug!("old frame count = {}", Arc::strong_count(frame));
+                    new_tracker.insert(*vaddr, frame.clone());
+                });
+
+                backend
+            }
+            Backend::Linear { .. } => self.clone(),
+        }
     }
 }
 
