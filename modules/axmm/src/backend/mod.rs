@@ -82,8 +82,12 @@ impl MappingBackend for Backend {
     }
 }
 
-//
 impl Clone for Backend {
+    /// The `Backend` enum implements the `Clone` trait to properly duplicate its internal state
+    /// when cloning the backend.
+    ///
+    /// For the `Alloc` variant, create a new allocator backend, clone its `tracker`,
+    /// and insert every `frame` from the original `tracker` into the new `tracker`.
     fn clone(&self) -> Self {
         match self {
             Backend::Alloc { populate, tracker } => {
@@ -93,14 +97,13 @@ impl Clone for Backend {
                     _ => unreachable!(),
                 };
 
-                tracker.for_each(|(vaddr, frame)| {
-                    debug!("old frame count = {}", Arc::strong_count(frame));
-                    new_tracker.insert(*vaddr, frame.clone());
+                tracker.for_each(|frame| {
+                    new_tracker.insert(frame.clone());
                 });
 
                 backend
             }
-            Backend::Linear { .. } => self.clone(),
+            Backend::Linear { pa_va_offset } => Self::new_linear(*pa_va_offset),
         }
     }
 }

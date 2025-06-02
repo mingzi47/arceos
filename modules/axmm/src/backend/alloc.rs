@@ -4,61 +4,59 @@ use axhal::{
     mem::virt_to_phys,
     paging::{MappingFlags, PageSize, PageTable},
 };
-use kspin::SpinRaw;
+use kspin::SpinNoIrq;
 use memory_addr::{PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr};
-
-use crate::{PAGE_SIZE_1G, PAGE_SIZE_2M};
 
 use super::Backend;
 
 pub struct FrameTracker {
-    inner: SpinRaw<Vec<(VirtAddr, Arc<Frame>)>>,
+    inner: SpinNoIrq<Vec<Arc<Frame>>>,
 }
 
 impl FrameTracker {
     fn new() -> Self {
         Self {
-            inner: SpinRaw::new(Vec::new()),
+            inner: SpinNoIrq::new(Vec::new()),
         }
     }
 
     pub fn for_each<F>(&self, f: F)
     where
-        F: FnMut(&(VirtAddr, Arc<Frame>)),
+        F: FnMut(&Arc<Frame>),
     {
         self.inner.lock().iter().for_each(f);
     }
 
-    pub fn find(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
+    pub fn find(&self, paddr: PhysAddr) -> Option<Arc<Frame>> {
         self.inner
             .lock()
             .iter()
-            .find(|(vaddr, frame)| *vaddr <= addr && addr <= *vaddr + frame.size().into())
-            .map(|(_, frame)| frame.clone())
+            .find(|frame| frame.contains(paddr))
+            .map(|frame| frame.clone())
     }
 
-    pub fn insert(&self, vaddr: VirtAddr, frame: Arc<Frame>) {
-        self.inner.lock().push((vaddr, frame));
+    pub fn insert(&self, frame: Arc<Frame>) {
+        self.inner.lock().push(frame);
     }
 
     pub fn remove(&self, paddr: PhysAddr) {
         let mut vec = self.inner.lock();
         let index = vec
             .iter()
-            .position(|(_, frame)| frame.contains(paddr))
+            .position(|frame| frame.contains(paddr))
             .expect("Tried to remove a frame that was not present");
         vec.remove(index);
     }
 }
 
 pub struct Frame {
-    inner: SpinRaw<GlobalPage>,
+    inner: SpinNoIrq<GlobalPage>,
 }
 
 impl Frame {
     fn new(page: GlobalPage) -> Self {
         Self {
-            inner: SpinRaw::new(page),
+            inner: SpinNoIrq::new(page),
         }
     }
 
@@ -72,21 +70,12 @@ impl Frame {
     pub fn contains(&self, paddr: PhysAddr) -> bool {
         let start = self.start_paddr();
         let size = self.inner.lock().size();
-
-        start <= paddr && paddr <= start + size
+        // left-closed, right-open interval
+        start <= paddr && paddr < start + size
     }
 
     pub fn start_paddr(&self) -> PhysAddr {
         self.inner.lock().start_paddr(virt_to_phys)
-    }
-
-    pub fn size(&self) -> PageSize {
-        match self.inner.lock().size() {
-            PAGE_SIZE_4K => PageSize::Size4K,
-            PAGE_SIZE_2M => PageSize::Size2M,
-            PAGE_SIZE_1G => PageSize::Size1G,
-            _ => unreachable!(),
-        }
     }
 }
 
@@ -101,8 +90,9 @@ impl Frame {
 /// Returns an `Option<Arc<Frame>>`:
 /// - `Some(Arc<Frame>)`: Allocation succeeded; the frame is wrapped in a reference-counted pointer.
 /// - `None`: Allocation failed (e.g., out of memory).
-pub fn alloc_frame(zeroed: bool) -> Option<Arc<Frame>> {
-    GlobalPage::alloc_contiguous(1, PAGE_SIZE_4K)
+pub fn alloc_frame(zeroed: bool, page_size: usize) -> Option<Arc<Frame>> {
+    let page_num = page_size / PAGE_SIZE_4K;
+    GlobalPage::alloc_contiguous(page_num, page_size)
         .ok()
         .map(|mut page| {
             if zeroed {
@@ -140,9 +130,9 @@ impl Backend {
         if populate {
             // allocate all possible physical frames for populated mapping.
             for addr in PageIter4K::new(start, start + size).unwrap() {
-                if let Some(page) = alloc_frame(true) {
+                if let Some(page) = alloc_frame(true, PAGE_SIZE_4K) {
                     if let Ok(tlb) = pt.map(addr, page.start_paddr(), PageSize::Size4K, flags) {
-                        trakcer.insert(addr, page);
+                        trakcer.insert(page);
                         tlb.ignore(); // TLB flush on map is unnecessary, as there are no outdated mappings.
                     } else {
                         return false;
@@ -188,13 +178,13 @@ impl Backend {
     ) -> bool {
         if populate {
             false // Populated mappings should not trigger page faults.
-        } else if let Some(page) = alloc_frame(true) {
+        } else if let Some(page) = alloc_frame(true, PAGE_SIZE_4K) {
             // Allocate a physical frame lazily and map it to the fault address.
             // `vaddr` does not need to be aligned. It will be automatically
             // aligned during `pt.map` regardless of the page size.
             pt.map(vaddr, page.start_paddr(), PageSize::Size4K, orig_flags)
                 .map(|tlb| {
-                    tracker.insert(vaddr, page);
+                    tracker.insert(page);
                     tlb.flush()
                 })
                 .is_ok()

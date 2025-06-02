@@ -8,6 +8,7 @@ use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
 use memory_set::{MemoryArea, MemorySet};
+use page_table_multiarch::PageSize;
 
 use crate::backend::{Backend, alloc_frame};
 use crate::mapping_err_to_ax_err;
@@ -374,7 +375,7 @@ impl AddrSpace {
         if let Some(area) = self.areas.find(vaddr) {
             let orig_flags = area.flags();
             if orig_flags.contains(access_flags) {
-                if let Ok(_) = self.pt.query(vaddr) {
+                if let Ok((paddr, _, page_size)) = self.pt.query(vaddr) {
                     // TODO: skip Shared
                     if !access_flags.contains(MappingFlags::WRITE) {
                         return false;
@@ -382,7 +383,7 @@ impl AddrSpace {
                     // 1. page fault caused by write
                     // 2. pte exists
                     // 3. Not shared memory
-                    return self.handle_page_fault_cow(vaddr);
+                    return self.handle_page_fault_cow(vaddr, paddr, page_size);
                 } else {
                     return area
                         .backend()
@@ -398,7 +399,11 @@ impl AddrSpace {
         let mut new_aspace = Self::new_empty(self.base(), self.size())?;
 
         for area in self.areas.iter() {
-            let backend = area.backend();
+            let backend = match area.backend() {
+                Backend::Alloc { populate, .. } => Backend::new_alloc(*populate),
+                Backend::Linear { .. } => area.backend().clone(),
+            };
+
             // Remap the memory area in the new address space.
             let new_area =
                 MemoryArea::new(area.start(), area.size(), area.flags(), backend.clone());
@@ -454,31 +459,37 @@ impl AddrSpace {
         let new_pt = &mut new_aspace.pt;
         let old_pt = &mut self.pt;
 
-        // Copy the memory area in the new address space.
         for area in self.areas.iter() {
             let mut backend = area.backend().clone();
             // TODO: Shared mem area
             match &mut backend {
                 // Forcing `populate = false` is to prevent the subsequent `new_aspace.areas.map`
                 // from mapping page table entries for the virtual addresses.
-                Backend::Alloc {
-                    populate, tracker, ..
-                } => {
+                Backend::Alloc { populate, .. } => {
                     *populate = false;
 
                     let mut flags = area.flags();
                     flags.remove(MappingFlags::WRITE);
-                    tracker.for_each(|(vaddr, frame)| {
-                        old_pt
-                            .protect(*vaddr, flags)
-                            .map(|(_, tlb)| tlb.flush())
-                            .ok();
-                        // The same physical page is mapped in the new page table
-                        new_pt
-                            .map(*vaddr, frame.start_paddr(), frame.size(), flags)
-                            .map(|tlb| tlb.flush())
-                            .ok();
-                    });
+
+                    //If the page is mapped in the old page table:
+                    // - Update its permissions in the old page table using `flags`.
+                    // - Map the same physical page into the new page table at the same
+                    // virtual address, with the same page size and `flags`.
+                    // TODO: huge page
+                    for vaddr in PageIter4K::new(area.start(), area.end())
+                        .expect("Failed to create page iterator")
+                    {
+                        if let Ok((paddr, _, page_size)) = old_pt.query(vaddr) {
+                            old_pt
+                                .protect(vaddr, flags)
+                                .map(|(_, tlb)| tlb.flush())
+                                .ok();
+                            new_pt
+                                .map(vaddr, paddr, page_size, flags)
+                                .map(|tlb| tlb.flush())
+                                .ok();
+                        }
+                    }
                 }
                 // Linear-backed regions are usually allocated by the kernel and are shared
                 Backend::Linear { .. } => (),
@@ -503,11 +514,19 @@ impl AddrSpace {
     /// # Returns
     /// - `true` if the page fault was handled successfully.
     /// - `false` if the fault handling failed (e.g., allocation failed or invalid ref count).
-    fn handle_page_fault_cow(&mut self, vaddr: VirtAddr) -> bool {
+    fn handle_page_fault_cow(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        page_size: PageSize,
+    ) -> bool {
         let area = self.areas.find(vaddr).unwrap();
         match area.backend() {
             Backend::Alloc { tracker, .. } => {
-                let old_frame = tracker.find(vaddr).unwrap();
+                let old_frame = match tracker.find(paddr) {
+                    Some(frame) => frame,
+                    None => return false,
+                };
 
                 match Arc::strong_count(&old_frame) {
                     ..=1 => false,
@@ -522,12 +541,11 @@ impl AddrSpace {
                     // Allocates the new page and copies the contents of the original page,
                     // remapping the virtual address to the physical address of the new page.
                     // NOTE: Reduce the page's reference count
-                    // TODO: huge page
-                    3.. => match alloc_frame(false) {
+                    3.. => match alloc_frame(false, page_size.into()) {
                         Some(new_frame) => {
                             new_frame.copy_from(old_frame.clone());
                             tracker.remove(old_frame.start_paddr());
-                            tracker.insert(vaddr, new_frame.clone());
+                            tracker.insert(new_frame.clone());
                             self.pt
                                 .remap(vaddr, new_frame.start_paddr(), area.flags())
                                 .map(|(_, tlb)| {
